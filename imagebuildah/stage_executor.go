@@ -1431,7 +1431,6 @@ func (s *StageExecutor) Execute(ctx context.Context, base string) (imgID string,
 			// and copy the content.
 			canMatchCacheOnlyAfterRun = (step.Command == command.Add || step.Command == command.Copy)
 			if canMatchCacheOnlyAfterRun {
-				s.didExecute = true
 				if err = ib.Run(step, s, noRunsRemaining); err != nil {
 					logrus.Debugf("Error building at step %+v: %v", *step, err)
 					return "", nil, false, fmt.Errorf("building at STEP \"%s\": %w", step.Message, err)
@@ -1467,6 +1466,9 @@ func (s *StageExecutor) Execute(ctx context.Context, base string) (imgID string,
 						pulledAndUsedCacheImage = true
 					}
 				}
+			}
+			if canMatchCacheOnlyAfterRun && !pulledAndUsedCacheImage {
+				s.didExecute = true
 			}
 		}
 
