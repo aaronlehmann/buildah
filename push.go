@@ -1,6 +1,7 @@
 package buildah
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -8,8 +9,11 @@ import (
 
 	"github.com/containers/buildah/pkg/blobcache"
 	"github.com/containers/common/libimage"
+	"github.com/containers/image/v5/docker"
 	"github.com/containers/image/v5/docker/reference"
+	"github.com/containers/image/v5/image"
 	"github.com/containers/image/v5/manifest"
+	"github.com/containers/image/v5/pkg/blobinfocache"
 	"github.com/containers/image/v5/pkg/compression"
 	"github.com/containers/image/v5/transports"
 	"github.com/containers/image/v5/types"
@@ -17,6 +21,7 @@ import (
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/archive"
 	digest "github.com/opencontainers/go-digest"
+	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 )
 
@@ -40,6 +45,7 @@ func cacheLookupReferenceFunc(directory string, compress types.LayerCompression)
 
 // PushOptions can be used to alter how an image is copied somewhere.
 type PushOptions struct {
+	Logger *logrus.Logger
 	// Compression specifies the type of compression which is applied to
 	// layer blobs.  The default is to not use compression, but
 	// archive.Gzip is recommended.
@@ -125,7 +131,12 @@ func Push(ctx context.Context, image string, dest types.ImageReference, options 
 	if options.Compression == archive.Gzip {
 		compress = types.Compress
 	}
-	libimageOptions.SourceLookupReferenceFunc = cacheLookupReferenceFunc(options.BlobDirectory, compress)
+	realBlobCache := cacheLookupReferenceFunc(options.BlobDirectory, compress)
+	libimageOptions.SourceLookupReferenceFunc = func(ref types.ImageReference) (types.ImageReference, error) {
+		options.Logger.Infof("Looking up source image %q %q", ref.Transport().Name(), ref.StringWithinTransport())
+		src, err := realBlobCache(ref)
+		return stubbedBlobsImageReference{ImageReference: src, logger: options.Logger}, err
+	}
 
 	runtime, err := libimage.RuntimeFromStore(options.Store, &libimage.RuntimeOptions{SystemContext: options.SystemContext})
 	if err != nil {
@@ -152,4 +163,65 @@ func Push(ctx context.Context, image string, dest types.ImageReference, options 
 	}
 
 	return ref, manifestDigest, nil
+}
+
+type stubbedBlobsImageReference struct {
+	types.ImageReference
+	logger *logrus.Logger
+}
+
+func (ref stubbedBlobsImageReference) NewImageSource(ctx context.Context, sys *types.SystemContext) (types.ImageSource, error) {
+	src, err := ref.ImageReference.NewImageSource(ctx, sys)
+	return stubbedBlobsImageSource{
+		ImageSource: src,
+		logger:      ref.logger,
+		cache:       blobinfocache.DefaultCache(sys),
+	}, err
+}
+
+type stubbedBlobsImageSource struct {
+	types.ImageSource
+	logger *logrus.Logger
+	cache  types.BlobInfoCache
+}
+
+func (src stubbedBlobsImageSource) LayerInfosForCopy(ctx context.Context, instanceDigest *digest.Digest) ([]types.BlobInfo, error) {
+	updatedBlobInfos := []types.BlobInfo{}
+	infos, err := src.ImageSource.LayerInfosForCopy(ctx, instanceDigest)
+	if err != nil {
+		return nil, err
+	}
+	if infos == nil {
+		return nil, nil
+	}
+	for _, layerBlob := range infos {
+		src.logger.Infof("blob %s", layerBlob.Digest)
+		candidates := src.cache.CandidateLocations(docker.Transport, types.BICTransportScope{Opaque: "dockerregistry.test.netflix.net:7002"}, layerBlob.Digest, true)
+		for _, c := range candidates {
+			src.logger.Infof("candidate %s", c.Digest, c.Location.Opaque)
+		}
+		if len(candidates) > 0 {
+			// We have a cached blob reference for this layer - that means
+			// we've pulled or pushed it before and there's no need to push
+			// it to cache.
+			src.logger.Infof("stubbing layer %s", layerBlob.Digest)
+			blobInfo := types.BlobInfo{
+				Digest:    image.GzippedEmptyLayerDigest,
+				Size:      int64(len(image.GzippedEmptyLayer)),
+				MediaType: imgspecv1.MediaTypeImageLayerGzip,
+			}
+			updatedBlobInfos = append(updatedBlobInfos, blobInfo)
+		} else {
+			updatedBlobInfos = append(updatedBlobInfos, layerBlob)
+		}
+	}
+	return updatedBlobInfos, nil
+}
+
+func (src stubbedBlobsImageSource) GetBlob(ctx context.Context, info types.BlobInfo, infoCache types.BlobInfoCache) (io.ReadCloser, int64, error) {
+	if info.Digest == image.GzippedEmptyLayerDigest {
+		src.logger.Infof("returning empty blob")
+		return io.NopCloser(bytes.NewReader(image.GzippedEmptyLayer)), int64(len(image.GzippedEmptyLayer)), nil
+	}
+	return src.ImageSource.GetBlob(ctx, info, infoCache)
 }

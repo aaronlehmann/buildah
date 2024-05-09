@@ -9,13 +9,17 @@ import (
 	"github.com/containers/buildah/define"
 	"github.com/containers/common/libimage"
 	"github.com/containers/common/pkg/config"
+	"github.com/containers/image/v5/manifest"
 	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
 	"github.com/containers/storage"
+	digest "github.com/opencontainers/go-digest"
+	"github.com/sirupsen/logrus"
 )
 
 // PullOptions can be used to alter how an image is copied in from somewhere.
 type PullOptions struct {
+	Logger *logrus.Logger
 	// SignaturePolicyPath specifies an override location for the signature
 	// policy which should be used for verifying the new image as it is
 	// being written.  Except in specific circumstances, no value should be
@@ -62,6 +66,10 @@ func Pull(ctx context.Context, imageName string, options PullOptions) (imageID s
 	libimageOptions.OciDecryptConfig = options.OciDecryptConfig
 	libimageOptions.AllTags = options.AllTags
 	libimageOptions.RetryDelay = &options.RetryDelay
+	libimageOptions.SourceLookupReferenceFunc = func(ref types.ImageReference) (types.ImageReference, error) {
+		options.Logger.Infof("Looking up source image for pull %q %q", ref.Transport().Name(), ref.StringWithinTransport())
+		return recordPulledBlobsReference{ImageReference: ref, logger: options.Logger}, err
+	}
 	libimageOptions.DestinationLookupReferenceFunc = cacheLookupReferenceFunc(options.BlobDirectory, types.PreserveOriginal)
 
 	if options.MaxRetries > 0 {
@@ -97,4 +105,38 @@ func Pull(ctx context.Context, imageName string, options PullOptions) (imageID s
 	}
 
 	return pulledImages[0].ID(), nil
+}
+
+type recordPulledBlobsReference struct {
+	types.ImageReference
+	logger *logrus.Logger
+}
+
+func (ref recordPulledBlobsReference) NewImageSource(ctx context.Context, sys *types.SystemContext) (types.ImageSource, error) {
+	src, err := ref.ImageReference.NewImageSource(ctx, sys)
+	return recordPulledBlobsImageSource{ImageSource: src, logger: ref.logger}, err
+}
+
+type recordPulledBlobsImageSource struct {
+	types.ImageSource
+	logger *logrus.Logger
+}
+
+func (src recordPulledBlobsImageSource) GetManifest(ctx context.Context, instanceDigest *digest.Digest) ([]byte, string, error) {
+	manBytes, manifestType, err := src.ImageSource.GetManifest(ctx, instanceDigest)
+	if err != nil {
+		return manBytes, manifestType, err
+	}
+
+	src.logger.Infof("Got manifest:")
+	src.logger.Infof("%s", manBytes)
+
+	man, err := manifest.FromBlob(manBytes, manifestType)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, layer := range man.LayerInfos() {
+		src.logger.Infof("layer digest: %s", layer.Digest.String())
+	}
+	return manBytes, manifestType, nil
 }

@@ -1701,6 +1701,7 @@ func (s *StageExecutor) historyAndDiffIDsMatch(baseHistory []v1.History, baseDif
 	// our history should be as long as the base's, plus one entry for what
 	// we're doing
 	if len(history) != len(baseHistory)+1 {
+		fmt.Fprintf(s.executor.out, "rejecting: number of layers\n")
 		return false
 	}
 	// check that each entry in the base history corresponds to an entry in
@@ -1708,6 +1709,7 @@ func (s *StageExecutor) historyAndDiffIDsMatch(baseHistory []v1.History, baseDif
 	expectedDiffIDs := 0
 	for i := range baseHistory {
 		if !historyEntriesEqual(baseHistory[i], history[i]) {
+			fmt.Fprintf(s.executor.out, "rejecting: history entries equal\n")
 			return false
 		}
 		if !baseHistory[i].EmptyLayer {
@@ -1715,24 +1717,28 @@ func (s *StageExecutor) historyAndDiffIDsMatch(baseHistory []v1.History, baseDif
 		}
 	}
 	if len(baseDiffIDs) != expectedDiffIDs {
+		fmt.Fprintf(s.executor.out, "rejecting: expected diff ids\n")
 		return false
 	}
 	if buildAddsLayer {
 		// we're adding a layer, so we should have exactly one more
 		// layer than the base image
 		if len(diffIDs) != expectedDiffIDs+1 {
+			fmt.Fprintf(s.executor.out, "rejecting: build adds layer\n")
 			return false
 		}
 	} else {
 		// we're not adding a layer, so we should have exactly the same
 		// layers as the base image
 		if len(diffIDs) != expectedDiffIDs {
+			fmt.Fprintf(s.executor.out, "rejecting: expected diff ids\n")
 			return false
 		}
 	}
 	// compare the diffs for the layers that we should have in common
 	for i := range baseDiffIDs {
 		if diffIDs[i] != baseDiffIDs[i] {
+			fmt.Fprintf(s.executor.out, "rejecting: diff id %d differs (%s != %s)\n", i, diffIDs[i], baseDiffIDs[i])
 			return false
 		}
 	}
@@ -1945,7 +1951,7 @@ func (s *StageExecutor) generateCacheKey(ctx context.Context, currNode *parser.N
 
 // cacheImageReference is internal function which generates ImageReference from Named repo sources
 // and a tag.
-func cacheImageReferences(repos []reference.Named, cachekey string) ([]types.ImageReference, error) {
+func cacheImageReferences(repos []reference.Named, cachekey string, out io.Writer) ([]types.ImageReference, error) {
 	var result []types.ImageReference
 	for _, repo := range repos {
 		tagged, err := reference.WithTag(repo, cachekey)
@@ -1956,22 +1962,74 @@ func cacheImageReferences(repos []reference.Named, cachekey string) ([]types.Ima
 		if err != nil {
 			return nil, fmt.Errorf("failed generating docker reference for %q: %w", tagged, err)
 		}
-		result = append(result, dest)
+		result = append(result, pushOnlyBuiltLayersRef{ImageReference: dest, out: out})
 	}
 	return result, nil
+}
+
+type pushOnlyBuiltLayersRef struct {
+	types.ImageReference
+	out io.Writer
+}
+
+func (ref pushOnlyBuiltLayersRef) NewImageDestination(ctx context.Context, sys *types.SystemContext) (types.ImageDestination, error) {
+	dest, err := ref.ImageReference.NewImageDestination(ctx, sys)
+	return pushOnlyBuiltLayersDest{ImageDestination: dest, out: ref.out}, err
+}
+
+func (ref pushOnlyBuiltLayersRef) NewImageSource(ctx context.Context, sys *types.SystemContext) (types.ImageSource, error) {
+	src, err := ref.ImageReference.NewImageSource(ctx, sys)
+	return pushOnlyBuiltLayersSource{ImageSource: src, out: ref.out}, err
+}
+
+type pushOnlyBuiltLayersDest struct {
+	types.ImageDestination
+	out io.Writer
+}
+
+func (dest pushOnlyBuiltLayersDest) TryReusingBlob(ctx context.Context, info types.BlobInfo, cache types.BlobInfoCache, canSubstitute bool) (bool, types.BlobInfo, error) {
+	// TODO: something here to determine if we built this blob or not
+	fmt.Fprintf(dest.out, "called TryReusingBlob for %s %v\n", info.Digest, canSubstitute)
+	fmt.Fprintf(dest.out, "urls: %s", info.URLs)
+	fmt.Fprintf(dest.out, "media type: %s", info.MediaType)
+	return dest.ImageDestination.TryReusingBlob(ctx, info, cache, canSubstitute)
+}
+
+type pushOnlyBuiltLayersSource struct {
+	types.ImageSource
+	out io.Writer
+}
+
+func (src pushOnlyBuiltLayersSource) GetManifest(ctx context.Context, instanceDigest *digest.Digest) ([]byte, string, error) {
+	manBytes, manifestType, err := src.ImageSource.GetManifest(ctx, instanceDigest)
+	if err != nil {
+		return manBytes, manifestType, err
+	}
+
+	src.out.Write([]byte("Got manifest:\n" + string(manBytes) + "\n"))
+
+	man, err := manifest.FromBlob(manBytes, manifestType)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, layer := range man.LayerInfos() {
+		src.out.Write([]byte("layer digest: " + layer.Digest.String() + "\n"))
+	}
+	return manBytes, manifestType, nil
 }
 
 // pushCache takes the image id of intermediate image and attempts
 // to perform push at the remote repository with cacheKey as the tag.
 // Returns error if fails otherwise returns nil.
 func (s *StageExecutor) pushCache(ctx context.Context, src, cacheKey string) error {
-	destList, err := cacheImageReferences(s.executor.cacheTo, cacheKey)
+	destList, err := cacheImageReferences(s.executor.cacheTo, cacheKey, s.executor.out)
 	if err != nil {
 		return err
 	}
 	for _, dest := range destList {
 		logrus.Debugf("trying to push cache to dest: %+v from src:%+v", dest, src)
 		options := buildah.PushOptions{
+			Logger:              s.executor.logger,
 			Compression:         s.executor.compression,
 			SignaturePolicyPath: s.executor.signaturePolicyPath,
 			Store:               s.executor.store,
@@ -1997,13 +2055,14 @@ func (s *StageExecutor) pushCache(ctx context.Context, src, cacheKey string) err
 // image was pulled function returns image id otherwise returns empty
 // string "" or error if any error was encontered while pulling the cache.
 func (s *StageExecutor) pullCache(ctx context.Context, cacheKey string) (reference.Named, string, error) {
-	srcList, err := cacheImageReferences(s.executor.cacheFrom, cacheKey)
+	srcList, err := cacheImageReferences(s.executor.cacheFrom, cacheKey, s.executor.out)
 	if err != nil {
 		return nil, "", err
 	}
 	for _, src := range srcList {
 		logrus.Debugf("trying to pull cache from remote repo: %+v", src.DockerReference())
 		options := buildah.PullOptions{
+			Logger:              s.executor.logger,
 			SignaturePolicyPath: s.executor.signaturePolicyPath,
 			Store:               s.executor.store,
 			SystemContext:       s.executor.systemContext,
@@ -2043,6 +2102,7 @@ func (s *StageExecutor) intermediateImageExists(ctx context.Context, currNode *p
 		}
 	}
 	for _, image := range images {
+		fmt.Fprintf(s.executor.out, "candidate %s\n", image.ID)
 		// If s.executor.cacheTTL was specified
 		// then ignore processing image if it
 		// was created before the specified
@@ -2076,6 +2136,7 @@ func (s *StageExecutor) intermediateImageExists(ctx context.Context, currNode *p
 		// it means that this image is potentially a cached intermediate image from a previous
 		// build.
 		if s.builder.TopLayer != imageParentLayerID {
+			fmt.Fprintf(s.executor.out, "rejecting %s: parent layer mismatch %s %s\n", image.ID, s.builder.TopLayer, imageParentLayerID)
 			continue
 		}
 		// Next we double check that the history of this image is equivalent to the previous
@@ -2091,12 +2152,14 @@ func (s *StageExecutor) intermediateImageExists(ctx context.Context, currNode *p
 		// If this candidate isn't of the type that we're building, then it may have lost
 		// some format-specific information that a building-without-cache run wouldn't lose.
 		if manifestType != s.executor.outputFormat {
+			fmt.Fprintf(s.executor.out, "rejecting %s: manifest type\n", image.ID)
 			continue
 		}
 		// children + currNode is the point of the Dockerfile we are currently at.
 		if s.historyAndDiffIDsMatch(baseHistory, baseDiffIDs, currNode, history, diffIDs, addedContentDigest, buildAddsLayer) {
 			return image.ID, nil
 		}
+		fmt.Fprintf(s.executor.out, "rejecting %s\n", image.ID)
 	}
 	return "", nil
 }
