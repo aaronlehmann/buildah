@@ -1972,6 +1972,7 @@ func (s *StageExecutor) pushCache(ctx context.Context, src, cacheKey string) err
 	for _, dest := range destList {
 		logrus.Debugf("trying to push cache to dest: %+v from src:%+v", dest, src)
 		options := buildah.PushOptions{
+			Logger:              s.executor.logger,
 			Compression:         s.executor.compression,
 			SignaturePolicyPath: s.executor.signaturePolicyPath,
 			Store:               s.executor.store,
@@ -2004,6 +2005,7 @@ func (s *StageExecutor) pullCache(ctx context.Context, cacheKey string) (referen
 	for _, src := range srcList {
 		logrus.Debugf("trying to pull cache from remote repo: %+v", src.DockerReference())
 		options := buildah.PullOptions{
+			Logger:              s.executor.logger,
 			SignaturePolicyPath: s.executor.signaturePolicyPath,
 			Store:               s.executor.store,
 			SystemContext:       s.executor.systemContext,

@@ -2,6 +2,7 @@ package buildah
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -9,13 +10,18 @@ import (
 	"github.com/containers/buildah/define"
 	"github.com/containers/common/libimage"
 	"github.com/containers/common/pkg/config"
+	"github.com/containers/image/v5/manifest"
 	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
 	"github.com/containers/storage"
+	digest "github.com/opencontainers/go-digest"
+	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/sirupsen/logrus"
 )
 
 // PullOptions can be used to alter how an image is copied in from somewhere.
 type PullOptions struct {
+	Logger *logrus.Logger
 	// SignaturePolicyPath specifies an override location for the signature
 	// policy which should be used for verifying the new image as it is
 	// being written.  Except in specific circumstances, no value should be
@@ -62,6 +68,16 @@ func Pull(ctx context.Context, imageName string, options PullOptions) (imageID s
 	libimageOptions.OciDecryptConfig = options.OciDecryptConfig
 	libimageOptions.AllTags = options.AllTags
 	libimageOptions.RetryDelay = &options.RetryDelay
+	logger := logrus.StandardLogger()
+	if options.Logger != nil {
+		logger = options.Logger
+	}
+	libimageOptions.SourceLookupReferenceFunc = func(ref types.ImageReference) (types.ImageReference, error) {
+		return substituteStubbedBlobsRef{
+			ImageReference: ref,
+			logger:         logger,
+		}, err
+	}
 	libimageOptions.DestinationLookupReferenceFunc = cacheLookupReferenceFunc(options.BlobDirectory, types.PreserveOriginal)
 
 	if options.MaxRetries > 0 {
@@ -97,4 +113,72 @@ func Pull(ctx context.Context, imageName string, options PullOptions) (imageID s
 	}
 
 	return pulledImages[0].ID(), nil
+}
+
+type substituteStubbedBlobsRef struct {
+	types.ImageReference
+	logger *logrus.Logger
+}
+
+func (ref substituteStubbedBlobsRef) NewImageSource(ctx context.Context, sys *types.SystemContext) (types.ImageSource, error) {
+	src, err := ref.ImageReference.NewImageSource(ctx, sys)
+	return recordPulledBlobsImageSource{ImageSource: src, logger: ref.logger}, err
+}
+
+type recordPulledBlobsImageSource struct {
+	types.ImageSource
+	logger *logrus.Logger
+}
+
+const diffIDAnnotation = "diffid"
+
+func (src recordPulledBlobsImageSource) LayerInfosForCopy(ctx context.Context, instanceDigest *digest.Digest) ([]types.BlobInfo, error) {
+	manifestBlob, manifestType, err := src.GetManifest(ctx, instanceDigest)
+	if err != nil {
+		return nil, fmt.Errorf("reading image manifest: %w", err)
+	}
+	if manifest.MIMETypeIsMultiImage(manifestType) {
+		return nil, errors.New("can't copy layers for a manifest list (shouldn't be attempted)")
+	}
+	man, err := manifest.FromBlob(manifestBlob, manifestType)
+	if err != nil {
+		return nil, fmt.Errorf("parsing image manifest for: %w", err)
+	}
+
+	uncompressedLayerType := ""
+	switch manifestType {
+	case imgspecv1.MediaTypeImageManifest:
+		uncompressedLayerType = imgspecv1.MediaTypeImageLayer
+	case manifest.DockerV2Schema1MediaType, manifest.DockerV2Schema1SignedMediaType, manifest.DockerV2Schema2MediaType:
+		uncompressedLayerType = manifest.DockerV2SchemaLayerMediaTypeUncompressed
+	}
+
+	var (
+		changed    bool
+		layerInfos []types.BlobInfo
+	)
+	for _, layerInfo := range man.LayerInfos() {
+		src.logger.Debugf("layer digest: %s, annotations: %v", layerInfo.Digest.String(), layerInfo.Annotations)
+		if diffID := layerInfo.Annotations[diffIDAnnotation]; diffID != "" {
+			src.logger.Debugf("using diffid %s", diffID)
+			diffIDDigest, err := digest.Parse(diffID)
+			if err != nil {
+				return nil, fmt.Errorf("parsing diffid %q: %w", diffID, err)
+			}
+			layerInfos = append(layerInfos, types.BlobInfo{
+				Digest:    diffIDDigest,
+				Size:      -1,
+				MediaType: uncompressedLayerType,
+			})
+			changed = true
+		} else {
+			layerInfos = append(layerInfos, layerInfo.BlobInfo)
+		}
+	}
+	if changed {
+		src.logger.Infof("Reusing existing layers on disk which were stubbed in cache push")
+		return layerInfos, nil
+	}
+
+	return src.ImageSource.LayerInfosForCopy(ctx, instanceDigest)
 }
