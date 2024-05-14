@@ -3,6 +3,7 @@ package buildah
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -131,10 +132,15 @@ func Push(ctx context.Context, image string, dest types.ImageReference, options 
 		compress = types.Compress
 	}
 	realBlobCache := cacheLookupReferenceFunc(options.BlobDirectory, compress)
-	libimageOptions.SourceLookupReferenceFunc = func(ref types.ImageReference) (types.ImageReference, error) {
+	libimageOptions.SourceLookupReferenceFunc = realBlobCache
+	/*libimageOptions.SourceLookupReferenceFunc = func(ref types.ImageReference) (types.ImageReference, error) {
 		options.Logger.Infof("Looking up source image %q %q", ref.Transport().Name(), ref.StringWithinTransport())
 		src, err := realBlobCache(ref)
 		return stubbedBlobsImageReference{ImageReference: src, logger: options.Logger}, err
+	}*/
+	libimageOptions.DestinationLookupReferenceFunc = func(ref types.ImageReference) (types.ImageReference, error) {
+		options.Logger.Infof("Looking up dest image %q %q", ref.Transport().Name(), ref.StringWithinTransport())
+		return substituteLayerDiffIDRef{ImageReference: ref, store: options.Store, logger: options.Logger}, nil
 	}
 
 	runtime, err := libimage.RuntimeFromStore(options.Store, &libimage.RuntimeOptions{SystemContext: options.SystemContext})
@@ -224,4 +230,47 @@ func (src stubbedBlobsImageSource) GetBlob(ctx context.Context, info types.BlobI
 		return io.NopCloser(bytes.NewReader(image.GzippedEmptyLayer)), int64(len(image.GzippedEmptyLayer)), nil
 	}
 	return src.ImageSource.GetBlob(ctx, info, infoCache)
+}
+
+type substituteLayerDiffIDRef struct {
+	types.ImageReference
+	logger *logrus.Logger
+	store  storage.Store
+}
+
+func (ref substituteLayerDiffIDRef) NewImageDestination(ctx context.Context, sys *types.SystemContext) (types.ImageDestination, error) {
+	dst, err := ref.ImageReference.NewImageDestination(ctx, sys)
+	return substituteLayerDiffIDDest{
+		ImageDestination: dst,
+		logger:           ref.logger,
+		cache:            blobinfocache.DefaultCache(sys),
+		store:            ref.store,
+	}, err
+}
+
+type substituteLayerDiffIDDest struct {
+	types.ImageDestination
+	logger *logrus.Logger
+	cache  types.BlobInfoCache
+	store  storage.Store
+}
+
+func (dst substituteLayerDiffIDDest) TryReusingBlob(ctx context.Context, info types.BlobInfo, cache types.BlobInfoCache, canSubstitute bool) (bool, types.BlobInfo, error) {
+	dst.logger.Infof("TryReusingBlob %s", info.Digest)
+	candidates := cache.CandidateLocations(docker.Transport, types.BICTransportScope{Opaque: "dockerregistry.test.netflix.net:7002"}, info.Digest, true)
+	if len(candidates) > 0 {
+		dst.logger.Info("got candidate location for %s", info.Digest)
+		layers, err := dst.store.LayersByUncompressedDigest(info.Digest)
+		if err != nil && !errors.Is(err, storage.ErrLayerUnknown) {
+			return false, types.BlobInfo{}, fmt.Errorf(`looking for layers with digest %q: %w`, info.Digest, err)
+		}
+		if len(layers) > 0 {
+			dst.logger.Info("stubbing blob %s", info.Digest)
+			return true, types.BlobInfo{
+				Digest: info.Digest,
+				Size:   layers[0].UncompressedSize,
+			}, nil
+		}
+	}
+	return dst.ImageDestination.TryReusingBlob(ctx, info, cache, canSubstitute)
 }
