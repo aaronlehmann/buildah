@@ -21,7 +21,6 @@ import (
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/archive"
 	digest "github.com/opencontainers/go-digest"
-	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 )
 
@@ -185,7 +184,7 @@ type stubbedBlobsImageSource struct {
 	cache  types.BlobInfoCache
 }
 
-func (src stubbedBlobsImageSource) LayerInfosForCopy(ctx context.Context, instanceDigest *digest.Digest) ([]types.BlobInfo, error) {
+/*func (src stubbedBlobsImageSource) LayerInfosForCopy(ctx context.Context, instanceDigest *digest.Digest) ([]types.BlobInfo, error) {
 	updatedBlobInfos := []types.BlobInfo{}
 	infos, err := src.ImageSource.LayerInfosForCopy(ctx, instanceDigest)
 	if err != nil {
@@ -216,10 +215,11 @@ func (src stubbedBlobsImageSource) LayerInfosForCopy(ctx context.Context, instan
 		}
 	}
 	return updatedBlobInfos, nil
-}
+}*/
 
 func (src stubbedBlobsImageSource) GetBlob(ctx context.Context, info types.BlobInfo, infoCache types.BlobInfoCache) (io.ReadCloser, int64, error) {
-	if info.Digest == image.GzippedEmptyLayerDigest {
+	candidates := src.cache.CandidateLocations(docker.Transport, types.BICTransportScope{Opaque: "dockerregistry.test.netflix.net:7002"}, info.Digest, true)
+	if len(candidates) > 0 {
 		src.logger.Infof("returning empty blob")
 		return io.NopCloser(bytes.NewReader(image.GzippedEmptyLayer)), int64(len(image.GzippedEmptyLayer)), nil
 	}

@@ -107,6 +107,19 @@ func Pull(ctx context.Context, imageName string, options PullOptions) (imageID s
 	return pulledImages[0].ID(), nil
 }
 
+/*type pullDestWrapper struct {
+	types.ImageDestination
+	logger *logrus.Logger
+}
+
+func (dest pullDestWrapper) TryReusingBlob(ctx context.Context, info types.BlobInfo, cache types.BlobInfoCache, canSubstitute bool) (bool, types.BlobInfo, error) {
+	// TODO: something here to determine if we built this blob or not
+	fmt.Fprintf(dest.out, "called TryReusingBlob for %s %v\n", info.Digest)
+	fmt.Fprintf(dest.out, "urls: %s", info.URLs)
+	fmt.Fprintf(dest.out, "media type: %s", info.MediaType)
+	return dest.ImageDestination.TryReusingBlob(ctx, info, cache, canSubstitute)
+}*/
+
 type recordPulledBlobsReference struct {
 	types.ImageReference
 	logger *logrus.Logger
