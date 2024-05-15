@@ -224,7 +224,7 @@ func (src stubbedBlobsImageSource) LayerInfosForCopy(ctx context.Context, instan
 	if baseImage, ok := manifestStub.Annotations["org.opencontainers.image.base.name"]; ok {
 		if registry, _, ok := strings.Cut(baseImage, "/"); ok {
 			baseImageRegistry = registry
-			src.logger.Debugf("found base image registry %s", baseImageRegistry)
+			src.logger.Infof("found base image registry %s", baseImageRegistry)
 		}
 	}
 
@@ -244,7 +244,7 @@ func (src stubbedBlobsImageSource) LayerInfosForCopy(ctx context.Context, instan
 			// We have a cached blob reference for this layer - that means
 			// we've pulled or pushed it before and there's no need to push
 			// it to cache.
-			src.logger.Debugf("stubbing layer %s", layerBlob.Digest)
+			src.logger.Infof("stubbing layer %s", layerBlob.Digest)
 			blobInfo := types.BlobInfo{
 				Digest:    image.GzippedEmptyLayerDigest,
 				Size:      int64(len(image.GzippedEmptyLayer)),

@@ -122,17 +122,17 @@ type substituteStubbedBlobsRef struct {
 
 func (ref substituteStubbedBlobsRef) NewImageSource(ctx context.Context, sys *types.SystemContext) (types.ImageSource, error) {
 	src, err := ref.ImageReference.NewImageSource(ctx, sys)
-	return recordPulledBlobsImageSource{ImageSource: src, logger: ref.logger}, err
+	return substituteStubbedBlobsImageSource{ImageSource: src, logger: ref.logger}, err
 }
 
-type recordPulledBlobsImageSource struct {
+type substituteStubbedBlobsImageSource struct {
 	types.ImageSource
 	logger *logrus.Logger
 }
 
 const diffIDAnnotation = "diffid"
 
-func (src recordPulledBlobsImageSource) LayerInfosForCopy(ctx context.Context, instanceDigest *digest.Digest) ([]types.BlobInfo, error) {
+func (src substituteStubbedBlobsImageSource) LayerInfosForCopy(ctx context.Context, instanceDigest *digest.Digest) ([]types.BlobInfo, error) {
 	manifestBlob, manifestType, err := src.GetManifest(ctx, instanceDigest)
 	if err != nil {
 		return nil, fmt.Errorf("reading image manifest: %w", err)
